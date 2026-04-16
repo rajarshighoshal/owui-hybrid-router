@@ -7,6 +7,7 @@ version: 9.5
 
 import asyncio
 import base64
+import hashlib
 import logging
 import math
 import os
@@ -544,7 +545,14 @@ class Filter:
     async def _search_tavily(self, query: str, max_results: int = 4) -> str:
         if not self.valves.TAVILY_API_KEY:
             return "[No Tavily API Key Provided]"
-        cache_key = f"{query.strip().lower()}_{max_results}"
+        # Hash the query so raw user text never sits in RAM as a dict key.
+        # Content is public Tavily data, but the KEY preserved the original
+        # query verbatim for up to SEARCH_CACHE_TTL. On a shared family server
+        # that's a weak privacy smell — the hash removes it without changing
+        # cache semantics.
+        cache_key = hashlib.sha256(
+            f"{query.strip().lower()}_{max_results}".encode()
+        ).hexdigest()
         if cache_key in self.search_cache:
             entry = self.search_cache[cache_key]
             if time.time() - entry["timestamp"] < self.valves.SEARCH_CACHE_TTL:
@@ -760,9 +768,11 @@ class Filter:
                 logger.info("Auto-detected OWUI base URL from %s", env_key)
                 return self._owui_base_url
 
-        # 3. Probe common localhost ports
+        # 3. Probe common localhost ports. 11434 is ollama's port and must not
+        # be probed here — if ollama returns any accepted status on /api/v1/auths
+        # we would misidentify it as OWUI.
         session = await self._get_session()
-        for port in (8080, 3000, 80, 11434):
+        for port in (8080, 3000, 80):
             candidate = f"http://localhost:{port}"
             try:
                 async with session.head(
@@ -1529,7 +1539,10 @@ class Filter:
                 new_captions = 0
                 cached_captions = 0
                 for url in unique_urls:
-                    cache_key = f"{chat_id_for_cache}:{url[:200]}"
+                    # SHA-256 the URL so that huge data: URIs and long internal
+                    # paths can never collide via prefix match. Still chat-scoped.
+                    url_digest = hashlib.sha256(url.encode()).hexdigest()[:32]
+                    cache_key = f"{chat_id_for_cache}:{url_digest}"
                     if cache_key in self.image_caption_cache:
                         image_url_to_caption[url] = self.image_caption_cache[cache_key]
                         cached_captions += 1
