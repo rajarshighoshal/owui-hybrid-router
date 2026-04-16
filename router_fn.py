@@ -282,6 +282,21 @@ def _memory_content_hash(text: str) -> str:
     return hashlib.sha256(text.strip().encode("utf-8", errors="replace")).hexdigest()
 
 
+def _fts5_safe_query(text: str) -> str:
+    """Turn free-form text into a safe FTS5 MATCH pattern.
+
+    Default FTS5 syntax treats many chars specially (", *, :, (, )). We
+    extract alphanumeric tokens, quote each, and join with OR so any
+    token hit counts. Bounded at 16 tokens to keep queries cheap.
+    Returns '' if no usable tokens — caller should skip BM25.
+    """
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{1,}", text or "")
+    words = words[:16]
+    if not words:
+        return ""
+    return " OR ".join(f'"{w}"' for w in words)
+
+
 def _clean_for_memory(text: str) -> str:
     """Strip mechanical artifacts before storing a turn as memory.
 
@@ -485,6 +500,19 @@ class Filter:
             default=500,
             description="Hard cap on stored turns per chat. Oldest are dropped when exceeded. "
             "Prevents a single runaway chat from eating disk space.",
+        )
+        ENABLE_HYBRID_RETRIEVAL: bool = Field(
+            default=True,
+            description="Combine BM25 (keyword) and embedding (semantic) scores when "
+            "recalling memory. Uses SQLite FTS5 for BM25. Falls back to cosine-only "
+            "if FTS5 is unavailable or the query produces no safe tokens.",
+        )
+        ENABLE_QUERY_REWRITE: bool = Field(
+            default=True,
+            description="For short, pronoun-y follow-up messages ('and the EU version?', "
+            "'what about that'), ask the classifier LLM to rewrite the query into a "
+            "standalone form before embedding for recall. Fails open — uses the original "
+            "query if the rewrite call fails.",
         )
 
     def __init__(self):
@@ -1285,6 +1313,52 @@ class Filter:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_created ON chat_turns(created_at)"
                 )
+                # FTS5 for hybrid retrieval (Phase 2). content=external so the
+                # inverted index points at chat_turns.id; triggers keep sync.
+                conn.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS chat_turns_fts USING fts5("
+                    "content, content='chat_turns', content_rowid='id'"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE TRIGGER IF NOT EXISTS chat_turns_fts_ai "
+                    "AFTER INSERT ON chat_turns BEGIN "
+                    "  INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content); "
+                    "END"
+                )
+                conn.execute(
+                    "CREATE TRIGGER IF NOT EXISTS chat_turns_fts_au "
+                    "AFTER UPDATE ON chat_turns BEGIN "
+                    "  INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) "
+                    "  VALUES ('delete', old.id, old.content); "
+                    "  INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content); "
+                    "END"
+                )
+                conn.execute(
+                    "CREATE TRIGGER IF NOT EXISTS chat_turns_fts_ad "
+                    "AFTER DELETE ON chat_turns BEGIN "
+                    "  INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) "
+                    "  VALUES ('delete', old.id, old.content); "
+                    "END"
+                )
+                # One-time backfill for DBs that existed before Phase 2:
+                # if the FTS table is behind chat_turns, rebuild its index.
+                try:
+                    src = conn.execute(
+                        "SELECT COUNT(*) FROM chat_turns"
+                    ).fetchone()[0]
+                    fts = conn.execute(
+                        "SELECT COUNT(*) FROM chat_turns_fts"
+                    ).fetchone()[0]
+                    if fts < src:
+                        conn.execute(
+                            "INSERT INTO chat_turns_fts(chat_turns_fts) VALUES('rebuild')"
+                        )
+                        logger.info(
+                            "chat_turns_fts rebuilt from %d rows (was %d)", src, fts
+                        )
+                except Exception as e:
+                    logger.info("chat_turns_fts backfill skipped: %s", e)
                 conn.commit()
                 self._memory_conn = conn
                 logger.info("Chat memory DB ready at %s", path)
@@ -1353,12 +1427,17 @@ class Filter:
         query: str,
         exclude_hashes: set,
     ) -> list[tuple[str, str]]:
-        """Top-K most similar prior turns from THIS chat only.
+        """Top-K most relevant prior turns from THIS chat only.
+
+        Uses hybrid scoring (cosine embedding + BM25 keyword) when
+        ENABLE_HYBRID_RETRIEVAL is on and FTS5 accepts the query.
+        Falls back transparently to cosine-only on any FTS error.
 
         Returns list of (role, content). Empty when:
           - memory disabled / DB broken
           - chat has < CHAT_MEMORY_MIN_TURNS stored rows
           - query embedding fails
+
         `exclude_hashes` are content hashes already visible in the current
         body["messages"] — we don't re-inject what the model will already see.
         """
@@ -1373,6 +1452,8 @@ class Filter:
             ).fetchone()[0]
             if total < self.valves.CHAT_MEMORY_MIN_TURNS:
                 return []
+
+            # --- Embedding pool ---
             rows = list(
                 conn.execute(
                     "SELECT role, content, content_hash, embedding "
@@ -1385,7 +1466,11 @@ class Filter:
             qvec = await self._get_embedding(query[:2000])
             if not qvec:
                 return []
-            scored: list[tuple[float, str, str]] = []
+
+            # content_by_hash carries the row data; cos_by_hash is [0,1]-normed
+            # cosine similarity (shifted from [-1,1]).
+            content_by_hash: dict[str, tuple[str, str]] = {}
+            cos_by_hash: dict[str, float] = {}
             for role, content, ch, emb_blob in rows:
                 if ch in exclude_hashes or not emb_blob:
                     continue
@@ -1393,8 +1478,71 @@ class Filter:
                     vec = _f32_unpack(emb_blob)
                 except Exception:
                     continue
-                score = _cosine_similarity(qvec, vec)
-                scored.append((score, role, content))
+                cos = _cosine_similarity(qvec, vec)
+                content_by_hash[ch] = (role, content)
+                cos_by_hash[ch] = (cos + 1.0) / 2.0
+
+            # --- BM25 pool (optional, fail-open) ---
+            bm25_by_hash: dict[str, float] = {}
+            used_hybrid = False
+            if self.valves.ENABLE_HYBRID_RETRIEVAL:
+                try:
+                    fts_q = _fts5_safe_query(query)
+                    if fts_q:
+                        bm_rows = list(
+                            conn.execute(
+                                "SELECT ct.content_hash, bm25(chat_turns_fts) AS rank "
+                                "FROM chat_turns_fts "
+                                "JOIN chat_turns ct ON ct.id = chat_turns_fts.rowid "
+                                "WHERE ct.chat_id = ? AND chat_turns_fts MATCH ? "
+                                "ORDER BY rank LIMIT ?",
+                                (
+                                    chat_id,
+                                    fts_q,
+                                    self.valves.CHAT_MEMORY_TOP_K * 4,
+                                ),
+                            )
+                        )
+                        if bm_rows:
+                            ranks = [r[1] for r in bm_rows]
+                            # BM25: more-negative = better match. Normalize so
+                            # best → 1, worst → 0.
+                            mn, mx = min(ranks), max(ranks)
+                            span = mx - mn if mx != mn else 1.0
+                            for ch, rank in bm_rows:
+                                if ch in exclude_hashes:
+                                    continue
+                                bm25_by_hash[ch] = 1.0 - (rank - mn) / span
+                            # BM25 may surface hashes absent from the cosine
+                            # pool (e.g., embedding was None). Fetch their
+                            # row content so we can score them.
+                            missing = set(bm25_by_hash) - set(content_by_hash)
+                            if missing:
+                                qs = ",".join("?" * len(missing))
+                                for role, content, ch in conn.execute(
+                                    f"SELECT role, content, content_hash "
+                                    f"FROM chat_turns "
+                                    f"WHERE chat_id=? AND content_hash IN ({qs})",
+                                    (chat_id, *missing),
+                                ):
+                                    content_by_hash[ch] = (role, content)
+                            used_hybrid = True
+                except Exception as e:
+                    logger.info("FTS5 hybrid skipped (cosine-only): %s", e)
+                    bm25_by_hash = {}
+
+            # --- Merge scores ---
+            scored: list[tuple[float, str, str]] = []
+            for ch, (role, content) in content_by_hash.items():
+                cos = cos_by_hash.get(ch, 0.0)
+                if used_hybrid:
+                    bm = bm25_by_hash.get(ch, 0.0)
+                    # 60/40 cosine/BM25 — semantic is the stronger signal,
+                    # BM25 adds recall on exact-term matches (names, IDs).
+                    final = 0.6 * cos + 0.4 * bm
+                else:
+                    final = cos
+                scored.append((final, role, content))
             scored.sort(key=lambda t: t[0], reverse=True)
             top = scored[: self.valves.CHAT_MEMORY_TOP_K]
             return [(role, content) for _, role, content in top]
@@ -1403,6 +1551,66 @@ class Filter:
                 "Chat memory recall failed (chat=%s): %s", str(chat_id)[:20], e
             )
             return []
+
+    async def _rewrite_followup_query(
+        self, query: str, messages: list
+    ) -> Optional[str]:
+        """Rewrite a short pronoun-y follow-up into a standalone retrieval query.
+
+        Only fires when:
+          - ENABLE_QUERY_REWRITE is on
+          - the query is a recognised follow-up (_is_followup_query) OR
+            it's short (≤8 words) AND contains a pronoun
+          - there is at least one prior non-system message to anchor against
+
+        Returns the rewritten query, or None if not needed / rewrite failed.
+        Uses the cheap classifier fallback chain — rewrite cost is small.
+        """
+        if not self.valves.ENABLE_QUERY_REWRITE:
+            return None
+        words = query.split()
+        is_followup_like = _is_followup_query(query) or (
+            len(words) <= 8 and _PRONOUN_REF.search(query)
+        )
+        if not is_followup_like:
+            return None
+        prior = [
+            m for m in messages[:-1] if m.get("role") in ("user", "assistant")
+        ]
+        if not prior:
+            return None
+        # Cap at last 3 prior turns for context; anything older is noise here.
+        ctx_lines: list[str] = []
+        for m in prior[-3:]:
+            role = m.get("role", "user")
+            c = _extract_text(m.get("content", ""))[:200].strip()
+            if c:
+                ctx_lines.append(f"[{role}]: {_sanitize_query(c)}")
+        if not ctx_lines:
+            return None
+        prompt = (
+            "Rewrite the user's latest message as a standalone search query by "
+            "resolving pronouns and implicit references using the prior context. "
+            "Be concise (max 20 words). Output ONLY the rewritten query — "
+            "no preamble, no quotes, no explanation.\n\n"
+            "Prior context:\n"
+            + "\n".join(ctx_lines)
+            + f"\n\nUser's latest message: {_sanitize_query(query)}\n\n"
+            "Rewritten query:"
+        )
+        rewritten = await self._call_llm(
+            prompt,
+            self.valves.CLASSIFIER_MODEL,
+            max_tokens=60,
+            fallback_chain=CLASSIFIER_FALLBACK_CHAIN,
+        )
+        if not rewritten:
+            return None
+        cleaned = _strip_thinking_blocks(rewritten).strip().strip("'\"")
+        # Guard against runaway outputs
+        if not cleaned or len(cleaned) > 300:
+            return None
+        return cleaned
 
     async def _maybe_cleanup_memories(self) -> None:
         """Probabilistic GC (~1% of outlet calls). Two sweeps:
@@ -1815,8 +2023,19 @@ class Filter:
                 cleaned = _clean_for_memory(_extract_text(m.get("content", "")))
                 if cleaned:
                     exclude_hashes.add(_memory_content_hash(cleaned))
+            # Query rewriting for short / pronoun-y follow-ups — improves
+            # recall by resolving "it"/"that" against prior context before
+            # embedding. Falls back to routing_query on any failure.
+            recall_query = routing_query
+            rewritten = await self._rewrite_followup_query(query_raw, messages)
+            if rewritten:
+                recall_query = rewritten
+                await self._emit_status(
+                    __event_emitter__,
+                    f"🧠 Memory query rewritten for recall: {rewritten[:80]}",
+                )
             recalled = await self._recall_chat_memories(
-                chat_id, routing_query, exclude_hashes
+                chat_id, recall_query, exclude_hashes
             )
             if recalled:
                 memory_block = (
