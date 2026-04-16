@@ -11,7 +11,10 @@ import hashlib
 import logging
 import math
 import os
+import random
 import re
+import sqlite3
+import struct
 import time
 import uuid
 from collections import OrderedDict
@@ -244,6 +247,57 @@ def _cosine_similarity(v1: list, v2: list) -> float:
     return 0.0 if norm1 == 0 or norm2 == 0 else dot / (norm1 * norm2)
 
 
+# ---------------------------------------------------------------------------
+# Chat-memory helpers (Phase 1). Purely module-level — no per-chat state here.
+# ---------------------------------------------------------------------------
+
+# Acknowledgment-only messages have no retrieval value — skip them on store.
+_ACK_ONLY_RE = re.compile(
+    r"^\s*(ok(ay)?|yes|yep|yeah|no|nope|thanks?|thank\s*you|cool|"
+    r"got\s*it|sure|alright|fine|right|hmm+|uh+|mm+)[\s!.,?]*$",
+    re.IGNORECASE,
+)
+
+# Verification trailer appended by the outlet when citations fail — strip
+# before storing so the memory entry is just the answer, not the meta.
+_VERIFICATION_TRAILER_RE = re.compile(
+    r"\n\n---\n⚠️\s*\*\*Verification note:.*?(?=\n*$|\Z)",
+    re.DOTALL,
+)
+
+
+def _f32_pack(vec: list) -> bytes:
+    """Serialize a float list to raw float32 bytes for SQLite BLOB storage."""
+    return struct.pack(f"{len(vec)}f", *vec)
+
+
+def _f32_unpack(blob: bytes) -> list:
+    """Deserialize float32 bytes back to a Python list."""
+    count = len(blob) // 4
+    return list(struct.unpack(f"{count}f", blob))
+
+
+def _memory_content_hash(text: str) -> str:
+    """SHA-256 of normalized text. Used for chat-scoped dedup."""
+    return hashlib.sha256(text.strip().encode("utf-8", errors="replace")).hexdigest()
+
+
+def _clean_for_memory(text: str) -> str:
+    """Strip mechanical artifacts before storing a turn as memory.
+
+    Removes (in order): thinking blocks, ROUTER_STATE tags, the route-tag
+    header, and the verifier's UNVERIFIED trailer. Leaves the actual
+    user-visible answer intact.
+    """
+    if not text:
+        return ""
+    text = THINKING_BLOCK_RE.sub("", text)
+    text = re.sub(r"\[ROUTER_STATE:\s*[A-Z]+(?:_SEARCH)?\]", "", text)
+    text = _ROUTE_HEADER_RE.sub("", text, count=1)
+    text = _VERIFICATION_TRAILER_RE.sub("", text)
+    return text.strip()
+
+
 async def _check_response(resp: aiohttp.ClientResponse) -> None:
     if resp.status == 200:
         return
@@ -399,6 +453,39 @@ class Filter:
             "rich enough to preserve key details: visible text, error messages, code, chart labels, "
             "layout, colors, numbers. 300 tokens ≈ 2-3 paragraphs, enough for a complex screenshot.",
         )
+        ENABLE_CHAT_MEMORY: bool = Field(
+            default=True,
+            description="Persistent per-chat semantic memory. When a chat grows beyond "
+            "CHAT_MEMORY_MIN_TURNS, the router embeds the current query and injects the "
+            "top-K most similar prior turns (from THIS chat only) into the system prompt. "
+            "Strictly chat-scoped — the only filter on every query is WHERE chat_id=?. "
+            "Never leaks across chats or users.",
+        )
+        CHAT_MEMORY_DB_PATH: str = Field(
+            default="/app/backend/data/router_mem.db",
+            description="SQLite file for chat memory. Lives in OpenWebUI's persistent data "
+            "volume so it survives container recreation via deploy.sh's volume inheritance.",
+        )
+        CHAT_MEMORY_MIN_TURNS: int = Field(
+            default=15,
+            description="Only recall memory for chats with more than N total turns stored. "
+            "Below this, OpenWebUI's own chat-history injection is sufficient context.",
+        )
+        CHAT_MEMORY_TOP_K: int = Field(
+            default=8,
+            description="Number of most-similar prior turns to inject when recalling memory. "
+            "Higher = more recalled context, more input tokens.",
+        )
+        CHAT_MEMORY_TTL_DAYS: int = Field(
+            default=90,
+            description="Prune chat memory rows older than this many days. Ran probabilistically "
+            "on ~1%% of outlet calls along with the referential sweep.",
+        )
+        CHAT_MEMORY_MAX_TURNS_PER_CHAT: int = Field(
+            default=500,
+            description="Hard cap on stored turns per chat. Oldest are dropped when exceeded. "
+            "Prevents a single runaway chat from eating disk space.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -415,6 +502,11 @@ class Filter:
         # Prevents re-captioning the same image on follow-up turns.
         self.image_caption_cache: OrderedDict[str, str] = OrderedDict()
         self._owui_base_url: Optional[str] = None  # auto-detected, cached
+        # Chat memory state (Phase 1). Lazy-initialized; disabled sticky on
+        # any DB error so broken memory never breaks a reply.
+        self._memory_conn: Optional[sqlite3.Connection] = None
+        self._memory_conn_lock: Optional[asyncio.Lock] = None
+        self._memory_disabled: bool = False
 
         self.categories = {
             "FACTUAL": "Objective inquiries requiring real-world verification. Focus on data, laws, prices, and current events.",
@@ -1134,6 +1226,242 @@ class Filter:
         while len(self.sticky_routes) > self.valves.STICKY_MAX_CONVOS:
             self.sticky_routes.popitem(last=False)
 
+    # -----------------------------------------------------------------
+    # Chat memory (Phase 1): persistent per-chat semantic recall.
+    # Storage: SQLite at CHAT_MEMORY_DB_PATH inside OWUI's data volume.
+    # Strictly chat-scoped — every query uses WHERE chat_id=?.
+    # Fails open: any DB/embedding error logs a warning and memory
+    # silently no-ops; the main reply path is never blocked.
+    # -----------------------------------------------------------------
+
+    def _get_memory_conn_lock(self) -> asyncio.Lock:
+        if self._memory_conn_lock is None:
+            self._memory_conn_lock = asyncio.Lock()
+        return self._memory_conn_lock
+
+    async def _get_memory_conn(self) -> Optional[sqlite3.Connection]:
+        """Lazy-open the chat memory DB. None if disabled or init failed.
+
+        The connection is shared across requests (check_same_thread=False
+        plus SQLite's internal locking). WAL mode keeps reads non-blocking
+        during writes. On first init failure we mark memory disabled for
+        the life of the process to avoid repeated open-failure spam.
+        """
+        if not self.valves.ENABLE_CHAT_MEMORY or self._memory_disabled:
+            return None
+        if self._memory_conn is not None:
+            return self._memory_conn
+        async with self._get_memory_conn_lock():
+            if self._memory_conn is not None:
+                return self._memory_conn
+            try:
+                path = self.valves.CHAT_MEMORY_DB_PATH
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                conn = sqlite3.connect(path, check_same_thread=False, timeout=5)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS chat_turns (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        embedding BLOB,
+                        created_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_chat_hash "
+                    "ON chat_turns(chat_id, content_hash)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_chat ON chat_turns(chat_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_created ON chat_turns(created_at)"
+                )
+                conn.commit()
+                self._memory_conn = conn
+                logger.info("Chat memory DB ready at %s", path)
+                return conn
+            except Exception as e:
+                logger.warning(
+                    "Chat memory DB unavailable (%s) — memory disabled for this process.",
+                    e,
+                )
+                self._memory_disabled = True
+                return None
+
+    async def _store_chat_turn(
+        self, chat_id: str, role: str, raw_content: str
+    ) -> None:
+        """Store one turn. Idempotent via (chat_id, content_hash).
+
+        Strips mechanical detail first (think blocks, route tag, verification
+        trailer) so stored text is just the actual human-visible content.
+        Pure-acknowledgment turns ("ok", "thanks") are skipped — no retrieval
+        value and they pollute top-K.
+        """
+        if not chat_id:
+            return
+        content = _clean_for_memory(raw_content)
+        if not content or _ACK_ONLY_RE.match(content):
+            return
+        conn = await self._get_memory_conn()
+        if conn is None:
+            return
+        try:
+            ch = _memory_content_hash(content)
+            # Cheap dedup check: avoid an embedding call if we already have it.
+            already = conn.execute(
+                "SELECT 1 FROM chat_turns WHERE chat_id=? AND content_hash=? LIMIT 1",
+                (chat_id, ch),
+            ).fetchone()
+            if already:
+                return
+            vec = await self._get_embedding(content[:2000])
+            emb_blob = _f32_pack(vec) if vec else None
+            conn.execute(
+                "INSERT OR IGNORE INTO chat_turns "
+                "(chat_id, role, content, content_hash, embedding, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, role, content, ch, emb_blob, time.time()),
+            )
+            # Per-chat size cap — keep newest CHAT_MEMORY_MAX_TURNS_PER_CHAT.
+            max_n = self.valves.CHAT_MEMORY_MAX_TURNS_PER_CHAT
+            conn.execute(
+                "DELETE FROM chat_turns WHERE id IN ("
+                "  SELECT id FROM chat_turns WHERE chat_id=? "
+                "  ORDER BY created_at DESC LIMIT -1 OFFSET ?"
+                ")",
+                (chat_id, max_n),
+            )
+            conn.commit()
+        except Exception as e:
+            logger.warning(
+                "Chat memory store failed (chat=%s): %s", str(chat_id)[:20], e
+            )
+
+    async def _recall_chat_memories(
+        self,
+        chat_id: str,
+        query: str,
+        exclude_hashes: set,
+    ) -> list[tuple[str, str]]:
+        """Top-K most similar prior turns from THIS chat only.
+
+        Returns list of (role, content). Empty when:
+          - memory disabled / DB broken
+          - chat has < CHAT_MEMORY_MIN_TURNS stored rows
+          - query embedding fails
+        `exclude_hashes` are content hashes already visible in the current
+        body["messages"] — we don't re-inject what the model will already see.
+        """
+        if not chat_id or not query.strip():
+            return []
+        conn = await self._get_memory_conn()
+        if conn is None:
+            return []
+        try:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM chat_turns WHERE chat_id=?", (chat_id,)
+            ).fetchone()[0]
+            if total < self.valves.CHAT_MEMORY_MIN_TURNS:
+                return []
+            rows = list(
+                conn.execute(
+                    "SELECT role, content, content_hash, embedding "
+                    "FROM chat_turns WHERE chat_id=? AND embedding IS NOT NULL",
+                    (chat_id,),
+                )
+            )
+            if not rows:
+                return []
+            qvec = await self._get_embedding(query[:2000])
+            if not qvec:
+                return []
+            scored: list[tuple[float, str, str]] = []
+            for role, content, ch, emb_blob in rows:
+                if ch in exclude_hashes or not emb_blob:
+                    continue
+                try:
+                    vec = _f32_unpack(emb_blob)
+                except Exception:
+                    continue
+                score = _cosine_similarity(qvec, vec)
+                scored.append((score, role, content))
+            scored.sort(key=lambda t: t[0], reverse=True)
+            top = scored[: self.valves.CHAT_MEMORY_TOP_K]
+            return [(role, content) for _, role, content in top]
+        except Exception as e:
+            logger.warning(
+                "Chat memory recall failed (chat=%s): %s", str(chat_id)[:20], e
+            )
+            return []
+
+    async def _maybe_cleanup_memories(self) -> None:
+        """Probabilistic GC (~1% of outlet calls). Two sweeps:
+
+        1. TTL: delete rows older than CHAT_MEMORY_TTL_DAYS.
+        2. Referential: delete rows for chat_ids that no longer exist in
+           OWUI's webui.db 'chat' table (user deleted the chat in the UI).
+        """
+        if random.random() > 0.01:
+            return
+        conn = await self._get_memory_conn()
+        if conn is None:
+            return
+        try:
+            # 1. TTL sweep
+            cutoff = time.time() - self.valves.CHAT_MEMORY_TTL_DAYS * 86400
+            ttl_removed = conn.execute(
+                "DELETE FROM chat_turns WHERE created_at < ?", (cutoff,)
+            ).rowcount
+
+            # 2. Referential sweep — cross-check against webui.db.chat.
+            orphan_removed = 0
+            webui_db = "/app/backend/data/webui.db"
+            if os.path.exists(webui_db):
+                try:
+                    alive = sqlite3.connect(
+                        f"file:{webui_db}?mode=ro", uri=True, timeout=2
+                    )
+                    try:
+                        alive_ids = {r[0] for r in alive.execute("SELECT id FROM chat")}
+                    finally:
+                        alive.close()
+                    if alive_ids:
+                        memory_ids = {
+                            r[0]
+                            for r in conn.execute(
+                                "SELECT DISTINCT chat_id FROM chat_turns"
+                            )
+                        }
+                        orphans = memory_ids - alive_ids
+                        if orphans:
+                            qs = ",".join("?" * len(orphans))
+                            orphan_removed = conn.execute(
+                                f"DELETE FROM chat_turns WHERE chat_id IN ({qs})",
+                                tuple(orphans),
+                            ).rowcount
+                except Exception as e:
+                    logger.warning("Chat memory referential GC failed: %s", e)
+
+            conn.commit()
+            if ttl_removed or orphan_removed:
+                logger.info(
+                    "Chat memory GC: ttl_removed=%d orphan_removed=%d",
+                    ttl_removed,
+                    orphan_removed,
+                )
+        except Exception as e:
+            logger.warning("Chat memory cleanup failed: %s", e)
+
     def _build_classifier_prompt(self, messages: list, image_caption: str = "") -> str:
         recent = messages[-3:]
         lines = []
@@ -1478,6 +1806,35 @@ class Filter:
                     f"⚠️ Web search unavailable ({reason}). Answering without live data.",
                 )
 
+        # --- Chat memory recall: inject relevant prior turns when the chat
+        # is long enough to have meaningfully aged out of OWUI's visible
+        # history. Strictly chat-scoped; skipped if no chat_id. ---
+        if self.valves.ENABLE_CHAT_MEMORY and chat_id:
+            exclude_hashes = set()
+            for m in messages:
+                cleaned = _clean_for_memory(_extract_text(m.get("content", "")))
+                if cleaned:
+                    exclude_hashes.add(_memory_content_hash(cleaned))
+            recalled = await self._recall_chat_memories(
+                chat_id, routing_query, exclude_hashes
+            )
+            if recalled:
+                memory_block = (
+                    "=========================================\n"
+                    "RELEVANT PRIOR TURNS FROM THIS CHAT:\n"
+                    "(semantic recall — use as additional context; each bracket is a prior turn)\n"
+                    "=========================================\n"
+                )
+                for role, content in recalled:
+                    snippet = content[:800].strip()
+                    memory_block += f"[{role}] {snippet}\n\n"
+                memory_block += "=========================================\n\n"
+                system_content += memory_block
+                await self._emit_status(
+                    __event_emitter__,
+                    f"🧠 Recalled {len(recalled)} prior turn(s) from this chat.",
+                )
+
         system_content += (
             f"{self.prompts[best_match]}\n\n"
             f"ANTI-REFUSAL: Do NOT say 'I do not have internet access'. If search results were provided above, use them. "
@@ -1695,6 +2052,28 @@ class Filter:
                     __event_emitter__,
                     f"⚠️ Verifier timed out after {self.valves.OUTLET_VERIFY_TIMEOUT}s — stopping retries.",
                 )
+
+        # --- Chat memory: persist the finalized user+assistant turns and
+        # run periodic GC. All operations are fail-open; a failure here
+        # never reaches the user. ---
+        if self.valves.ENABLE_CHAT_MEMORY:
+            chat_id_out = self._extract_chat_id(body)
+            if chat_id_out:
+                user_msgs = [
+                    m for m in body["messages"] if m.get("role") == "user"
+                ]
+                if user_msgs:
+                    last_user_text = _extract_text(user_msgs[-1].get("content", ""))
+                    await self._store_chat_turn(
+                        chat_id_out, "user", last_user_text
+                    )
+                # Assistant content after all outlet massaging
+                # (header wrap + optional verification trailer). The
+                # _store_chat_turn path strips mechanical artifacts before
+                # storing — the memory entry is just the actual answer.
+                asst_text = _extract_text(body["messages"][-1].get("content", ""))
+                await self._store_chat_turn(chat_id_out, "assistant", asst_text)
+                await self._maybe_cleanup_memories()
 
         return body
 
