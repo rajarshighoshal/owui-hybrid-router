@@ -769,16 +769,22 @@ class Filter:
         model: str,
         max_tokens: int = 50,
         fallback_chain: Optional[list[str]] = None,
+        log_role: str = "unknown",
+        log_chat_id: Optional[str] = None,
     ) -> Optional[str]:
         """Call an LLM with automatic fallback to alternative models.
 
         If the primary model fails (503, timeout, not found), tries each
         model in the fallback_chain in order. Returns the first successful
         response, or None if all models fail.
+
+        Usage is recorded to request_log for every call, successful or
+        failed, via _log_request. log_role names the router-internal
+        purpose (classifier / verifier / caption / rewrite / summary /
+        regen). Logging failures are swallowed and never affect the call.
         """
         models_to_try = [model]
         if fallback_chain:
-            # Add fallbacks that aren't already the primary
             for fb in fallback_chain:
                 if fb != model and fb not in models_to_try:
                     models_to_try.append(fb)
@@ -786,6 +792,9 @@ class Filter:
         last_err = None
         for i, m in enumerate(models_to_try):
             is_fallback = i > 0
+            start = time.time()
+            captured_usage: dict = {}
+
             try:
 
                 async def _do_call(model_name=m):
@@ -807,6 +816,7 @@ class Filter:
                     ) as resp:
                         await _check_response(resp)
                         data = await resp.json()
+                        captured_usage.update(data.get("usage") or {})
                         choice = data["choices"][0]
                         if choice.get("finish_reason") == "length":
                             logger.warning(
@@ -816,6 +826,18 @@ class Filter:
                         return choice["message"]["content"].strip()
 
                 result = await _retry_request(_do_call)
+                latency_ms = int((time.time() - start) * 1000)
+                await self._log_request(
+                    chat_id=log_chat_id,
+                    model=m,
+                    call_role=log_role,
+                    prompt_tokens=captured_usage.get("prompt_tokens"),
+                    completion_tokens=captured_usage.get("completion_tokens"),
+                    total_tokens=captured_usage.get("total_tokens"),
+                    latency_ms=latency_ms,
+                    success=True,
+                    fallback=is_fallback,
+                )
                 if is_fallback:
                     logger.info(
                         "LLM fallback succeeded: %s (primary %s failed)",
@@ -825,6 +847,15 @@ class Filter:
                 return result
             except _NonRetryableError as e:
                 last_err = e
+                await self._log_request(
+                    chat_id=log_chat_id,
+                    model=m,
+                    call_role=log_role,
+                    latency_ms=int((time.time() - start) * 1000),
+                    success=False,
+                    fallback=is_fallback,
+                    error=str(e),
+                )
                 logger.warning(
                     "LLM non-retryable error (model=%s): %s — trying next fallback",
                     m.split("/")[-1],
@@ -833,6 +864,15 @@ class Filter:
                 continue
             except Exception as e:
                 last_err = e
+                await self._log_request(
+                    chat_id=log_chat_id,
+                    model=m,
+                    call_role=log_role,
+                    latency_ms=int((time.time() - start) * 1000),
+                    success=False,
+                    fallback=is_fallback,
+                    error=str(e),
+                )
                 logger.warning(
                     "LLM call failed after retries (model=%s): %s — trying next fallback",
                     m.split("/")[-1],
@@ -1054,14 +1094,16 @@ class Filter:
         vision_content: list[dict],
         max_tokens: int,
         event_emitter: EventEmitter = None,
+        log_role: str = "caption",
+        log_chat_id: Optional[str] = None,
     ) -> Optional[str]:
         """Call a vision model with automatic fallback across the caption chain.
 
         Tries each model in CAPTION_FALLBACK_CHAIN until one succeeds.
-        Returns the response text, or None if all fail.
+        Returns the response text, or None if all fail. Usage is recorded
+        to request_log just like _call_llm.
         """
         models_to_try = CAPTION_FALLBACK_CHAIN[:]
-        # Ensure the configured model is first
         if self.valves.IMAGE_CAPTION_MODEL in models_to_try:
             models_to_try.remove(self.valves.IMAGE_CAPTION_MODEL)
         models_to_try.insert(0, self.valves.IMAGE_CAPTION_MODEL)
@@ -1069,6 +1111,8 @@ class Filter:
         last_err = None
         for i, model_name in enumerate(models_to_try):
             is_fallback = i > 0
+            start = time.time()
+            captured_usage: dict = {}
             try:
 
                 async def _do_vision_call(mn=model_name):
@@ -1102,9 +1146,22 @@ class Filter:
                                 )
                             raise _NonRetryableError(err_msg)
                         data = await resp.json()
+                        captured_usage.update(data.get("usage") or {})
                         return data["choices"][0]["message"]["content"].strip()
 
                 result = await _retry_request(_do_vision_call)
+                latency_ms = int((time.time() - start) * 1000)
+                await self._log_request(
+                    chat_id=log_chat_id,
+                    model=model_name,
+                    call_role=log_role,
+                    prompt_tokens=captured_usage.get("prompt_tokens"),
+                    completion_tokens=captured_usage.get("completion_tokens"),
+                    total_tokens=captured_usage.get("total_tokens"),
+                    latency_ms=latency_ms,
+                    success=True,
+                    fallback=is_fallback,
+                )
                 if is_fallback and event_emitter:
                     await self._emit_status(
                         event_emitter,
@@ -1113,6 +1170,15 @@ class Filter:
                 return result
             except _NonRetryableError as e:
                 last_err = str(e)[:150]
+                await self._log_request(
+                    chat_id=log_chat_id,
+                    model=model_name,
+                    call_role=log_role,
+                    latency_ms=int((time.time() - start) * 1000),
+                    success=False,
+                    fallback=is_fallback,
+                    error=str(e),
+                )
                 logger.warning(
                     "Vision model non-retryable error (%s): %s",
                     model_name.split("/")[-1],
@@ -1121,6 +1187,15 @@ class Filter:
                 continue
             except Exception as e:
                 last_err = str(e)[:150]
+                await self._log_request(
+                    chat_id=log_chat_id,
+                    model=model_name,
+                    call_role=log_role,
+                    latency_ms=int((time.time() - start) * 1000),
+                    success=False,
+                    fallback=is_fallback,
+                    error=str(e),
+                )
                 logger.warning(
                     "Vision model failed after retries (%s): %s",
                     model_name.split("/")[-1],
@@ -1177,6 +1252,7 @@ class Filter:
             vision_content,
             self.valves.IMAGE_CAPTION_MAX_TOKENS,
             event_emitter=event_emitter,
+            log_role="caption",
         )
         if caption is None:
             await self._emit_status(
@@ -1241,6 +1317,7 @@ class Filter:
             vision_content,
             self.valves.IMAGE_PROXY_MAX_TOKENS,
             event_emitter=event_emitter,
+            log_role="caption_detailed",
         )
         if caption is None:
             await self._emit_status(
@@ -1333,6 +1410,35 @@ class Filter:
                 )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_created ON chat_turns(created_at)"
+                )
+                # Usage / analytics log. One row per LLM call made by the
+                # router (classifier / verifier / caption / rewrite /
+                # summary / main-if-available). Purely for your analysis
+                # — nothing reads this table at runtime.
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS request_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts REAL NOT NULL,
+                        chat_id TEXT,
+                        model TEXT NOT NULL,
+                        call_role TEXT,
+                        prompt_tokens INTEGER,
+                        completion_tokens INTEGER,
+                        total_tokens INTEGER,
+                        latency_ms INTEGER,
+                        success INTEGER DEFAULT 1,
+                        fallback INTEGER DEFAULT 0,
+                        error TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_log_ts ON request_log(ts)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_log_chat_ts "
+                    "ON request_log(chat_id, ts)"
                 )
                 # FTS5 for hybrid retrieval (Phase 2). content=external so the
                 # inverted index points at chat_turns.id; triggers keep sync.
@@ -1624,6 +1730,7 @@ class Filter:
             self.valves.CLASSIFIER_MODEL,
             max_tokens=60,
             fallback_chain=CLASSIFIER_FALLBACK_CHAIN,
+            log_role="rewrite",
         )
         if not rewritten:
             return None
@@ -1694,6 +1801,8 @@ class Filter:
                 prompt,
                 self.valves.MAIN_MODEL,
                 max_tokens=500,
+                log_role="summary",
+                log_chat_id=chat_id,
             )
             if not summary:
                 return
@@ -1736,6 +1845,56 @@ class Filter:
                 str(chat_id)[:20],
                 e,
             )
+
+    async def _log_request(
+        self,
+        chat_id: Optional[str],
+        model: str,
+        call_role: str,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        total_tokens: Optional[int] = None,
+        latency_ms: Optional[int] = None,
+        success: bool = True,
+        fallback: bool = False,
+        error: Optional[str] = None,
+    ) -> None:
+        """Append one row to request_log for analytics.
+
+        Intentionally lightweight — uses the same SQLite connection as
+        chat memory. Fails silently on any DB error (analytics must
+        never be able to break a reply).
+
+        `call_role` names the router-internal purpose of the call:
+          'classifier' | 'verifier' | 'caption' | 'caption_detailed' |
+          'rewrite' | 'summary' | 'regen' | 'main' (best-effort from body).
+        """
+        conn = await self._get_memory_conn()
+        if conn is None:
+            return
+        try:
+            conn.execute(
+                "INSERT INTO request_log "
+                "(ts, chat_id, model, call_role, prompt_tokens, completion_tokens, "
+                " total_tokens, latency_ms, success, fallback, error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    time.time(),
+                    chat_id,
+                    model,
+                    call_role,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    latency_ms,
+                    1 if success else 0,
+                    1 if fallback else 0,
+                    (error or "")[:300] if error else None,
+                ),
+            )
+            conn.commit()
+        except Exception as e:
+            logger.debug("request_log insert failed (non-fatal): %s", e)
 
     async def _referential_sweep(self) -> None:
         """Delete memory rows for chat_ids that no longer exist in webui.db.
@@ -1871,6 +2030,7 @@ class Filter:
             self.valves.VERIFIER_MODEL,
             max_tokens=200,
             fallback_chain=VERIFIER_FALLBACK_CHAIN,
+            log_role="verifier",
         )
         if not verdict:
             return True, "verifier LLM unavailable — fail-open"
@@ -2058,6 +2218,8 @@ class Filter:
                     self._build_classifier_prompt(messages, image_caption),
                     self.valves.CLASSIFIER_MODEL,
                     fallback_chain=CLASSIFIER_FALLBACK_CHAIN,
+                    log_role="classifier",
+                    log_chat_id=chat_id,
                 )
                 if llm_response is None:
                     await self._emit_status(
@@ -2569,6 +2731,8 @@ class Filter:
                 regen_prompt,
                 body.get("model") or self.valves.MAIN_MODEL,
                 max_tokens=self.valves.VERIFIER_MAX_TOKENS,
+                log_role="regen",
+                log_chat_id=self._extract_chat_id(body),
             )
             if not new_response:
                 await self._emit_status(
