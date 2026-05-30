@@ -111,6 +111,30 @@ class CitationRequest(BaseModel):
             "Leading 'doi:' or 'https://doi.org/' is stripped automatically."
         ),
     )
+    expected_title: Optional[str] = Field(
+        None,
+        description=(
+            "The title (or distinctive words of it) you BELIEVE this DOI points to. "
+            "Strongly recommended: the tool cross-checks the CrossRef record against "
+            "this and returns verified=false if they don't match, so a valid-but-wrong "
+            "DOI can't be cited by mistake. Leave null only if you have no expectation."
+        ),
+    )
+
+
+class CitationSearchRequest(BaseModel):
+    query: str = Field(
+        ...,
+        description=(
+            "Bibliographic search text — title, and optionally authors/year "
+            "(e.g. 'Gathercole Alloway Working Memory and Learning 2008'). Use this "
+            "instead of guessing DOIs when you only know the work, not its DOI."
+        ),
+    )
+    rows: int = Field(
+        3, ge=1, le=10,
+        description="How many candidate matches to return (default 3).",
+    )
 
 
 # --- Helpers --------------------------------------------------------------
@@ -457,32 +481,25 @@ def fetch_url(req: FetchUrlRequest) -> dict:
     ),
     operation_id="lookup_doi_citation",
 )
-def lookup_doi_citation(req: CitationRequest) -> dict:
-    doi = req.doi.strip()
-    for prefix in ("doi:", "https://doi.org/", "http://doi.org/", "https://dx.doi.org/"):
-        if doi.lower().startswith(prefix):
-            doi = doi[len(prefix):]
-            break
-    try:
-        r = httpx.get(
-            f"https://api.crossref.org/works/{quote(doi, safe='')}",
-            headers={"User-Agent": "owui-tool-server/0.3.0"},
-            timeout=15.0,
-        )
-        r.raise_for_status()
-        msg = r.json()["message"]
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=404, detail=f"CrossRef returned {e.response.status_code} for DOI {doi}")
-    except Exception as e:
-        logger.exception("DOI lookup failed")
-        raise HTTPException(status_code=502, detail=f"CrossRef lookup failed: {e}")
+def _title_similarity(a: str, b: str) -> float:
+    """Token-overlap ratio (Jaccard) between two titles, case/punct-insensitive."""
+    def toks(s: str) -> set:
+        return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+    ta, tb = toks(a), toks(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
 
+
+def _crossref_to_apa(msg: dict, fallback_doi: str = "") -> dict:
     authors = msg.get("author", []) or []
+
     def _author_str(a: dict) -> str:
         family = a.get("family", "").strip()
         given = a.get("given", "").strip()
         initials = "".join(f"{p[0]}." for p in given.split() if p)
         return f"{family}, {initials}".strip(", ")
+
     author_parts = [_author_str(a) for a in authors[:20] if a.get("family")]
     if len(authors) > 20:
         author_parts.append("...")
@@ -494,10 +511,11 @@ def lookup_doi_citation(req: CitationRequest) -> dict:
 
     title = (msg.get("title") or [""])[0]
     container = (msg.get("container-title") or [""])[0]
+    publisher = msg.get("publisher", "")
     volume = msg.get("volume", "")
     issue = msg.get("issue", "")
     pages = msg.get("page", "")
-    doi_canonical = msg.get("DOI", doi)
+    doi_canonical = msg.get("DOI", fallback_doi)
 
     parts = [f"{author_str} ({year}). {title}."]
     if container:
@@ -509,7 +527,10 @@ def lookup_doi_citation(req: CitationRequest) -> dict:
         if pages:
             loc += f", {pages}"
         parts.append(f"{loc}.")
-    parts.append(f"https://doi.org/{doi_canonical}")
+    elif publisher:
+        parts.append(f"{publisher}.")
+    if doi_canonical:
+        parts.append(f"https://doi.org/{doi_canonical}")
     apa = " ".join(parts)
 
     return {
@@ -517,6 +538,100 @@ def lookup_doi_citation(req: CitationRequest) -> dict:
         "apa": apa,
         "title": title,
         "year": year,
-        "container": container,
+        "container": container or publisher,
         "authors": [{"family": a.get("family"), "given": a.get("given")} for a in authors],
+    }
+
+
+def _fetch_crossref_work(doi: str) -> dict:
+    try:
+        r = httpx.get(
+            f"https://api.crossref.org/works/{quote(doi, safe='')}",
+            headers={"User-Agent": "owui-tool-server/0.3.0"},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        return r.json()["message"]
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=404,
+            detail=f"CrossRef returned {e.response.status_code} for DOI {doi}",
+        )
+    except Exception as e:
+        logger.exception("DOI lookup failed")
+        raise HTTPException(status_code=502, detail=f"CrossRef lookup failed: {e}")
+
+
+def lookup_doi_citation(req: CitationRequest) -> dict:
+    doi = req.doi.strip()
+    for prefix in ("doi:", "https://doi.org/", "http://doi.org/", "https://dx.doi.org/"):
+        if doi.lower().startswith(prefix):
+            doi = doi[len(prefix):]
+            break
+
+    msg = _fetch_crossref_work(doi)
+    result = _crossref_to_apa(msg, fallback_doi=doi)
+
+    # Verification gate: if the caller told us what they expect, confirm the
+    # CrossRef record actually matches. A valid DOI pointing at the WRONG work
+    # (common with SAGE 10.4135 prefixes) must NOT be silently citable.
+    if req.expected_title:
+        score = _title_similarity(req.expected_title, result["title"])
+        result["match_score"] = round(score, 2)
+        result["verified"] = score >= 0.4
+        if not result["verified"]:
+            result["warning"] = (
+                f"DOI resolves to '{result['title']}', which does NOT match the "
+                f"expected title '{req.expected_title}'. Do not cite this DOI for "
+                f"that work; search by title or cite from knowledge instead."
+            )
+    else:
+        result["verified"] = None
+        result["warning"] = (
+            "No expected_title was provided, so this DOI was not cross-checked. "
+            "Confirm the returned title matches the work you intend to cite."
+        )
+    return result
+
+
+@app.post(
+    "/search_citation",
+    summary="Find a work's citation by title/author (no DOI needed)",
+    description=(
+        "Search CrossRef bibliographically by title and/or author and return the "
+        "best APA matches with DOIs and a match_score. Use this INSTEAD of guessing "
+        "DOIs when you know the work but not its DOI. If the top match_score is low, "
+        "the work may not be in CrossRef — cite from knowledge rather than forcing it."
+    ),
+    operation_id="search_citation",
+)
+def search_citation(req: CitationSearchRequest) -> dict:
+    try:
+        r = httpx.get(
+            "https://api.crossref.org/works",
+            params={"query.bibliographic": req.query, "rows": req.rows},
+            headers={"User-Agent": "owui-tool-server/0.3.0"},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        items = r.json().get("message", {}).get("items", []) or []
+    except Exception as e:
+        logger.exception("citation search failed")
+        raise HTTPException(status_code=502, detail=f"CrossRef search failed: {e}")
+
+    results = []
+    for msg in items:
+        formatted = _crossref_to_apa(msg)
+        formatted["match_score"] = round(_title_similarity(req.query, formatted["title"]), 2)
+        results.append(formatted)
+    results.sort(key=lambda x: x["match_score"], reverse=True)
+    return {
+        "query": req.query,
+        "count": len(results),
+        "results": results,
+        "note": (
+            "match_score is title-token overlap with your query, not authority. "
+            "A low top score (< 0.3) likely means the work is not well indexed in "
+            "CrossRef; prefer citing from knowledge over forcing a weak match."
+        ),
     }
