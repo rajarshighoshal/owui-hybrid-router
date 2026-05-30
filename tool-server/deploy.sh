@@ -9,6 +9,11 @@ IMAGE="owui-tool-server:latest"
 CONTAINER="owui-tool-server"
 BACKUP_IMAGE="owui-tool-server:rollback"
 HOST_PORT=8001
+ENV_FILE="${TOOL_DIR}/tool-server.env"
+ENV_ARGS=()
+if [ -f "$ENV_FILE" ]; then
+    ENV_ARGS=(--env-file "$ENV_FILE")
+fi
 
 # Discover the network the existing open-webui container lives on.
 NETWORK=$(docker inspect open-webui \
@@ -39,6 +44,7 @@ if ! docker run -d \
         --name "$CONTAINER" \
         --network "$NETWORK" \
         --restart unless-stopped \
+        "${ENV_ARGS[@]}" \
         -p "127.0.0.1:${HOST_PORT}:8001" \
         "$IMAGE"; then
     echo "ERROR: failed to start new tool-server container"
@@ -47,6 +53,7 @@ if ! docker run -d \
             --name "$CONTAINER" \
             --network "$NETWORK" \
             --restart unless-stopped \
+            "${ENV_ARGS[@]}" \
             -p "127.0.0.1:${HOST_PORT}:8001" \
             "$BACKUP_IMAGE" >/dev/null
     fi
@@ -75,6 +82,7 @@ if docker image inspect "$BACKUP_IMAGE" >/dev/null 2>&1; then
         --name "$CONTAINER" \
         --network "$NETWORK" \
         --restart unless-stopped \
+        "${ENV_ARGS[@]}" \
         -p "127.0.0.1:${HOST_PORT}:8001" \
         "$BACKUP_IMAGE" >/dev/null
 fi

@@ -57,6 +57,13 @@ FORCE_SEARCH_PATTERNS = [
     re.compile(r"\bwhat'?s\s+the\s+latest\b", re.IGNORECASE),
 ]
 
+URL_RE = re.compile(r"https?://[^\s<>\])}]+", re.IGNORECASE)
+URL_FETCH_INTENT_PATTERNS = [
+    re.compile(r"\b(fetch|open|read|summari[sz]e|quote|extract|inspect)\b", re.IGNORECASE),
+    re.compile(r"\b(first|lead|intro(?:duction)?|specific)\s+section\b", re.IGNORECASE),
+    re.compile(r"\b(the\s+)?(?:url|link|page|article|webpage|site)\b", re.IGNORECASE),
+]
+
 DOCUMENT_REQUEST_PATTERNS = [
     re.compile(
         r"\b("
@@ -72,6 +79,27 @@ DOCUMENT_REQUEST_PATTERNS = [
     ),
 ]
 
+DOCUMENT_WRITING_ARTIFACT_RE = re.compile(
+    r"\b("
+    r"cover\s+letter|resume|cv|personal\s+statement|statement\s+of\s+purpose|"
+    r"sop|motivation\s+letter|bio|linkedin|email|letter|proposal|essay|"
+    r"placeholder"
+    r")\b",
+    re.IGNORECASE,
+)
+DOCUMENT_EXPORT_RE = re.compile(
+    r"\b(export|download|downloadable|save|create|make|generate)\b.{0,80}"
+    r"\b(docx|pdf|word\s+document|markdown|csv)\b"
+    r"|\b(docx|pdf|word\s+document|markdown|csv)\b.{0,80}"
+    r"\b(export|download|save)\b",
+    re.IGNORECASE,
+)
+CODING_CONTEXT_RE = re.compile(
+    r"\b(code|script|program|function|class|api|parse|parser|library|python|"
+    r"javascript|typescript|java|bash|sql|regex|package|module)\b",
+    re.IGNORECASE,
+)
+
 DOCUMENT_STYLE_PROMPT = (
     "DOCUMENT WRITING MODE:\n"
     "- Preserve the user's personal voice. Mirror their level of directness, energy, and vocabulary when there is enough prior context.\n"
@@ -80,7 +108,16 @@ DOCUMENT_STYLE_PROMPT = (
     "- Use concrete details from the prompt and recalled chat context: role, company, project, skills, constraints, motivation, and stakes.\n"
     "- If web search results are provided, use them as background context. Do not put citations or a sources section into cover letters, personal statements, bios, or emails unless the user explicitly asks for cited writing.\n"
     "- Do not invent personal history, credentials, employers, publications, grades, locations, or achievements. If a required detail is missing, write [NEEDS DETAIL: ...].\n"
+    "- For export requests, write the full final content and pass that same content to the export tool. Do not replace the answer with a meta-summary of what you wrote unless the user explicitly asks for only a file.\n"
     "- Make the result feel authored by this user, not by a template: specific, human, and purposeful.\n"
+)
+
+URL_FETCH_PROMPT = (
+    "URL FETCH MODE:\n"
+    "- The user supplied a specific URL. Use the fetch_url tool for that URL before summarizing, quoting, or describing the page unless the page text is already in the conversation.\n"
+    "- Do not use Tavily search merely because a URL was provided. Use web search only when the user explicitly asks for broader search beyond the supplied page.\n"
+    "- Respect the requested scope exactly, such as 'first section', 'introduction', or a requested sentence count.\n"
+    "- Do not add a citations or sources section by default for single-page summaries; mention the source page only if it helps clarity.\n"
 )
 
 CATEGORY_NAMES = frozenset({"FACTUAL", "REASONING", "CODING", "RESEARCH", "CASUAL"})
@@ -152,7 +189,18 @@ _PRONOUN_REF = re.compile(
 )
 
 _ROUTE_HEADER_RE = re.compile(
-    r"\A`[^\n`]*\b(?:FACTUAL|REASONING|CODING|RESEARCH|CASUAL|WRITING)\b[^\n`]*`\s*\n(?:>\s*[^\n]*\n)?\s*",
+    r"\A`[^\n`]*\b(?:FACTUAL|REASONING|CODING|RESEARCH|CASUAL|WRITING|FETCH)\b[^\n`]*`\s*\n(?:>\s*[^\n]*\n)?\s*",
+    re.IGNORECASE,
+)
+
+ROUTER_STATE_RE = re.compile(
+    r"\[ROUTER_STATE:\s*([A-Z]+)(_SEARCH)?\]"
+    r"|<!--\s*ROUTER_STATE:\s*([A-Z]+)(_SEARCH)?\s*-->",
+    re.IGNORECASE,
+)
+ROUTER_STATE_STRIP_RE = re.compile(
+    r"\[ROUTER_STATE:\s*[A-Z]+(?:_SEARCH)?\]"
+    r"|<!--\s*ROUTER_STATE:\s*[A-Z]+(?:_SEARCH)?\s*-->",
     re.IGNORECASE,
 )
 
@@ -185,6 +233,20 @@ def _is_document_request(query: str) -> bool:
     if not query or len(query) < 8:
         return False
     return any(p.search(query) for p in DOCUMENT_REQUEST_PATTERNS)
+
+
+def _is_document_output_request(query: str) -> bool:
+    if not _is_document_request(query):
+        return False
+    if DOCUMENT_WRITING_ARTIFACT_RE.search(query) or DOCUMENT_EXPORT_RE.search(query):
+        return True
+    return not CODING_CONTEXT_RE.search(query)
+
+
+def _is_url_fetch_request(query: str) -> bool:
+    if not query or not URL_RE.search(query):
+        return False
+    return any(p.search(query) for p in URL_FETCH_INTENT_PATTERNS)
 
 
 class _NonRetryableError(Exception):
@@ -383,7 +445,7 @@ def _clean_for_memory(text: str) -> str:
     if not text:
         return ""
     text = THINKING_BLOCK_RE.sub("", text)
-    text = re.sub(r"\[ROUTER_STATE:\s*[A-Z]+(?:_SEARCH)?\]", "", text)
+    text = ROUTER_STATE_STRIP_RE.sub("", text)
     text = _ROUTE_HEADER_RE.sub("", text, count=1)
     text = _VERIFICATION_TRAILER_RE.sub("", text)
     return text.strip()
@@ -2484,6 +2546,8 @@ class Filter:
         messages = body["messages"]
         query_raw = _extract_text(messages[-1]["content"]).strip()
         document_request = _is_document_request(query_raw)
+        document_output_request = _is_document_output_request(query_raw)
+        url_fetch_request = _is_url_fetch_request(query_raw)
 
         # --- Image-based routing augmentation ---
         # If the last user message contains images, generate a short caption
@@ -2576,11 +2640,19 @@ class Filter:
         search_category = best_match
         if document_request and best_match in ["FACTUAL", "RESEARCH"]:
             best_match = "CASUAL"
+        elif document_output_request and best_match == "CODING":
+            best_match = "CASUAL"
+        elif url_fetch_request and best_match in ["FACTUAL", "RESEARCH"]:
+            best_match = "CASUAL"
 
         will_search = (
-            (search_category in ["FACTUAL", "RESEARCH"] and not document_request)
+            (
+                search_category in ["FACTUAL", "RESEARCH"]
+                and not document_request
+                and not url_fetch_request
+            )
             or force_search
-            or sticky_searched
+            or (sticky_searched and not url_fetch_request)
         )
         search_flag = "_SEARCH" if will_search else ""
         self._set_sticky(chat_id, best_match, will_search)
@@ -2590,6 +2662,7 @@ class Filter:
             "category": best_match,
             "searched": will_search,
             "document_request": document_request,
+            "url_fetch_request": url_fetch_request,
         }
 
         # Triple fallback for routing state: metadata (primary) → sticky_routes (2nd) → tag (3rd).
@@ -2597,7 +2670,7 @@ class Filter:
         system_content = (
             f"OUTPUT STRUCTURE:\n"
             f"1. If you want to reason, put it inside <think>...</think> tags (hidden from the user).\n"
-            f"2. Then emit exactly this single line: [ROUTER_STATE: {best_match}{search_flag}]\n"
+            f"2. Then emit exactly this HTML comment on its own line: <!-- ROUTER_STATE: {best_match}{search_flag} -->\n"
             f"3. Then write your answer for the user.\n"
             f"Do NOT narrate your plan or restate the question in visible output outside of a "
             f"<think>...</think> block.\n\n"
@@ -2720,6 +2793,9 @@ class Filter:
                     "USER WRITING PREFERENCES:\n"
                     f"{self.valves.DOCUMENT_STYLE_GUIDE.strip()}\n\n"
                 )
+
+        if url_fetch_request:
+            system_content += f"{URL_FETCH_PROMPT}\n"
 
         system_content += (
             f"{self.prompts[best_match]}\n\n"
@@ -2879,6 +2955,18 @@ class Filter:
         search_results_injected = bool(router_state.get("searched"))
         search_context_from_inlet = router_state.get("search_context", "")
         document_request = bool(router_state.get("document_request"))
+        url_fetch_request = bool(router_state.get("url_fetch_request"))
+        if not document_request or not url_fetch_request:
+            user_msgs_for_mode = [
+                _extract_text(m.get("content", ""))
+                for m in body["messages"]
+                if m.get("role") == "user"
+            ]
+            last_user_for_mode = user_msgs_for_mode[-1] if user_msgs_for_mode else ""
+            if not document_request:
+                document_request = _is_document_request(last_user_for_mode)
+            if not url_fetch_request:
+                url_fetch_request = _is_url_fetch_request(last_user_for_mode)
 
         # Fallback 1: Filter-instance sticky cache (survives even if OWUI strips body metadata).
         if not category:
@@ -2889,10 +2977,10 @@ class Filter:
 
         # Fallback 2: parse the model's tag (only works if inlet still emits it).
         parse_copy = _strip_thinking_blocks(response)
-        state_match = re.search(r"\[ROUTER_STATE:\s*([A-Z]+)(_SEARCH)?\]", parse_copy)
+        state_match = ROUTER_STATE_RE.search(parse_copy)
         if not category and state_match:
-            category = state_match.group(1)
-            search_results_injected = bool(state_match.group(2))
+            category = (state_match.group(1) or state_match.group(3)).upper()
+            search_results_injected = bool(state_match.group(2) or state_match.group(4))
 
         if not category:
             category = "CASUAL"
@@ -2902,20 +2990,28 @@ class Filter:
             )
 
         display_response = _strip_thinking_blocks(response)
-        tag_re = re.compile(r"\[ROUTER_STATE:\s*[A-Z]+(?:_SEARCH)?\]")
-        tag_matches = list(tag_re.finditer(display_response))
+        tag_matches = list(ROUTER_STATE_STRIP_RE.finditer(display_response))
         if tag_matches:
             last = tag_matches[-1]
             display_response = display_response[last.end() :].strip()
         else:
             display_response = display_response.strip()
 
+        override_label = None
+        override_emoji = None
+        if document_request:
+            override_label = "WRITING"
+            override_emoji = "✍️"
+        elif url_fetch_request:
+            override_label = "FETCH"
+            override_emoji = "🔗"
+
         final_content = self._build_route_content(
             category,
             searched=search_results_injected,
             body_text=display_response,
-            override_label="WRITING" if document_request else None,
-            override_emoji="✍️" if document_request else None,
+            override_label=override_label,
+            override_emoji=override_emoji,
         )
         body["messages"][-1]["content"] = final_content
         await self._emit_replace(__event_emitter__, final_content)

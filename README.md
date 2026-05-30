@@ -33,6 +33,16 @@ Intercepts every message in OpenWebUI and adds:
 
 `update.sh` pulls from git, updates the function row in `webui.db`, rebuilds/restarts the external tool-server, and re-applies OWUI middleware patches. `auto-deploy.sh` is a cron-friendly wrapper for servers that should track `origin/main`.
 
+The tool server can attach exported DOCX/PDF/CSV/Markdown files directly to the assistant message when OpenWebUI forwards tool headers and auth is configured. Keep these settings in an untracked `tool-server/tool-server.env`:
+
+```bash
+OPENWEBUI_BASE_URL=http://open-webui:8080
+OPENWEBUI_API_KEY=...
+OPENWEBUI_ATTACH_EXPORTS=true
+```
+
+If the env file is absent, exports still return a JSON data URI payload as a fallback.
+
 ## Configuration
 
 All behavior is controlled via Valves (OpenWebUI's per-function config):
@@ -40,7 +50,7 @@ All behavior is controlled via Valves (OpenWebUI's per-function config):
 | Valve | Default | What it does |
 |---|---|---|
 | `CLASSIFIER_MODEL` | `groq/llama-3.1-8b-instant` | Routing classifier (Groq primary) |
-| `MAIN_MODEL` | `accounts/fireworks/models/glm-5p1` | Primary chat model |
+| `MAIN_MODEL` | `accounts/fireworks/models/deepseek-v4-pro` | Primary chat model |
 | `VERIFIER_MODEL` | `groq/llama-3.3-70b-versatile` | Citation auditor (Groq primary) |
 | `ENABLE_CHAT_MEMORY` | `true` | Per-chat semantic memory |
 | `CHAT_MEMORY_TOP_K` | `8` | Recalled turns per query |

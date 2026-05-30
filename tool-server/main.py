@@ -11,6 +11,7 @@ import csv
 import ipaddress
 import io
 import logging
+import os
 import re
 import socket
 import tempfile
@@ -21,7 +22,7 @@ from urllib.parse import quote, urljoin, urlparse
 import httpx
 import pypandoc
 import trafilatura
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("tool-server")
@@ -33,8 +34,16 @@ app = FastAPI(
         "File export (docx/pdf/md/csv), readable web extraction, and DOI→APA "
         "citation lookup. Used by OpenWebUI models via tool calls."
     ),
-    version="0.2.1",
+    version="0.3.0",
 )
+
+OPENWEBUI_BASE_URL = os.getenv("OPENWEBUI_BASE_URL", "http://open-webui:8080").rstrip("/")
+OPENWEBUI_API_KEY = os.getenv("OPENWEBUI_API_KEY", "")
+OPENWEBUI_ATTACH_EXPORTS = os.getenv("OPENWEBUI_ATTACH_EXPORTS", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 
 # --- Request models -------------------------------------------------------
@@ -44,7 +53,8 @@ class ExportRequest(BaseModel):
         ...,
         description=(
             "The markdown content to convert. May include headings, lists, "
-            "in-text citations like (Author, 2024), code blocks, tables, links."
+            "in-text citations like (Author, 2024), code blocks, tables, links. "
+            "Pass the complete final draft/content, not an outline or summary of it."
         ),
     )
     filename: Optional[str] = Field(
@@ -127,16 +137,94 @@ def _convert_pandoc(markdown: str, fmt: str, extra_args: list[str]) -> bytes:
         out_path.unlink(missing_ok=True)
 
 
-def _file_result(data: bytes, media_type: str, filename: str) -> list[Any]:
+def _auth_header_from_request(request: Optional[Request]) -> dict[str, str]:
+    inbound_auth = request.headers.get("authorization") if request else ""
+    if inbound_auth:
+        return {"Authorization": inbound_auth}
+    if OPENWEBUI_API_KEY:
+        return {"Authorization": f"Bearer {OPENWEBUI_API_KEY}"}
+    return {}
+
+
+def _attach_file_to_openwebui(
+    request: Optional[Request],
+    data: bytes,
+    media_type: str,
+    filename: str,
+) -> dict[str, Any]:
+    if not OPENWEBUI_ATTACH_EXPORTS:
+        return {"attached_to_chat": False, "attach_reason": "disabled"}
+
+    chat_id = request.headers.get("x-open-webui-chat-id") if request else ""
+    message_id = request.headers.get("x-open-webui-message-id") if request else ""
+    headers = _auth_header_from_request(request)
+    if not chat_id or not message_id:
+        return {"attached_to_chat": False, "attach_reason": "missing chat/message headers"}
+    if not headers:
+        return {"attached_to_chat": False, "attach_reason": "missing OpenWebUI auth"}
+
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            upload = client.post(
+                f"{OPENWEBUI_BASE_URL}/api/v1/files/",
+                headers={**headers, "Accept": "application/json"},
+                files={"file": (filename, data, media_type)},
+                data={"process": "false"},
+            )
+            upload.raise_for_status()
+            uploaded = upload.json()
+            file_id = uploaded.get("id") or uploaded.get("file", {}).get("id")
+            if not file_id:
+                return {
+                    "attached_to_chat": False,
+                    "attach_reason": "upload returned no file id",
+                }
+
+            file_item = {
+                "type": "file",
+                "id": file_id,
+                "name": filename,
+                "url": file_id,
+                "size": len(data),
+                "mime_type": media_type,
+                "file": uploaded,
+            }
+            event = client.post(
+                f"{OPENWEBUI_BASE_URL}/api/v1/chats/{chat_id}/messages/{message_id}/event",
+                headers={**headers, "Accept": "application/json"},
+                json={"type": "files", "data": {"files": [file_item]}},
+            )
+            event.raise_for_status()
+            return {
+                "attached_to_chat": True,
+                "openwebui_file_id": file_id,
+            }
+    except Exception as e:
+        logger.warning("OpenWebUI file attach failed for %s: %s", filename, e)
+        return {
+            "attached_to_chat": False,
+            "attach_reason": f"OpenWebUI attach failed: {type(e).__name__}",
+        }
+
+
+def _file_result(
+    data: bytes,
+    media_type: str,
+    filename: str,
+    request: Optional[Request] = None,
+) -> list[Any]:
     b64 = base64.b64encode(data).decode("ascii")
+    metadata = {
+        "status": "success",
+        "filename": filename,
+        "mime_type": media_type,
+        "bytes": len(data),
+    }
+    if request is not None:
+        metadata.update(_attach_file_to_openwebui(request, data, media_type, filename))
     return [
         f"data:{media_type};base64,{b64}",
-        {
-            "status": "success",
-            "filename": filename,
-            "mime_type": media_type,
-            "bytes": len(data),
-        },
+        metadata,
     ]
 
 
@@ -193,7 +281,7 @@ def _validate_public_http_url(url: str) -> None:
 
 def _download_public_url(url: str) -> str:
     current = url
-    headers = {"User-Agent": "owui-tool-server/0.2.1"}
+    headers = {"User-Agent": "owui-tool-server/0.3.0"}
     with httpx.Client(timeout=15.0, follow_redirects=False, headers=headers) as client:
         for _ in range(5):
             _validate_public_http_url(current)
@@ -219,12 +307,13 @@ def health() -> dict:
     description=(
         "Convert APA-formatted (or any) markdown to a Word document. Returns "
         "an OpenWebUI-compatible file payload. Use when the user asks for a Word "
-        "document, .docx export, or 'export to Word'."
+        "document, .docx export, or 'export to Word'. Generate the full final "
+        "markdown first, then export that same content."
     ),
     response_description="OWUI file payload for a .docx file",
     operation_id="export_docx",
 )
-def export_docx(req: ExportRequest) -> list[Any]:
+def export_docx(req: ExportRequest, request: Request) -> list[Any]:
     filename = _safe_filename(req.filename, "document")
     extra_args = ["--standalone"]
     if req.title:
@@ -238,6 +327,7 @@ def export_docx(req: ExportRequest) -> list[Any]:
         data,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         f"{filename}.docx",
+        request,
     )
 
 
@@ -247,12 +337,13 @@ def export_docx(req: ExportRequest) -> list[Any]:
     description=(
         "Convert markdown to a PDF document. Returns an OpenWebUI-compatible "
         "file payload. Use when the user asks for a PDF, a printable version, or "
-        "a read-only share."
+        "a read-only share. Generate the full final markdown first, then export "
+        "that same content."
     ),
     response_description="OWUI file payload for a PDF file",
     operation_id="export_pdf",
 )
-def export_pdf(req: ExportRequest) -> list[Any]:
+def export_pdf(req: ExportRequest, request: Request) -> list[Any]:
     filename = _safe_filename(req.filename, "document")
     # weasyprint = lightweight; xelatex would give publication-grade output
     # but bloats the image by ~3GB.
@@ -264,7 +355,7 @@ def export_pdf(req: ExportRequest) -> list[Any]:
     except Exception as e:
         logger.exception("pdf export failed")
         raise HTTPException(status_code=500, detail=f"pdf conversion failed: {e}")
-    return _file_result(data, "application/pdf", f"{filename}.pdf")
+    return _file_result(data, "application/pdf", f"{filename}.pdf", request)
 
 
 @app.post(
@@ -273,17 +364,18 @@ def export_pdf(req: ExportRequest) -> list[Any]:
     description=(
         "Save markdown content as a downloadable .md file. Use when the user "
         "asks for a markdown export, a .md file, or wants to download the "
-        "raw markdown of a draft."
+        "raw markdown of a draft. Export the complete content, not a summary."
     ),
     response_description="OWUI file payload for a .md file",
     operation_id="export_markdown",
 )
-def export_markdown(req: ExportRequest) -> list[Any]:
+def export_markdown(req: ExportRequest, request: Request) -> list[Any]:
     filename = _safe_filename(req.filename, "document")
     return _file_result(
         req.markdown.encode("utf-8"),
         "text/markdown",
         f"{filename}.md",
+        request,
     )
 
 
@@ -298,7 +390,7 @@ def export_markdown(req: ExportRequest) -> list[Any]:
     response_description="OWUI file payload for a .csv file",
     operation_id="export_csv",
 )
-def export_csv(req: CsvExportRequest) -> list[Any]:
+def export_csv(req: CsvExportRequest, request: Request) -> list[Any]:
     if not req.rows:
         raise HTTPException(status_code=400, detail="rows cannot be empty")
     filename = _safe_filename(req.filename, "data")
@@ -311,6 +403,7 @@ def export_csv(req: CsvExportRequest) -> list[Any]:
         buf.getvalue().encode("utf-8"),
         "text/csv",
         f"{filename}.csv",
+        request,
     )
 
 
@@ -320,7 +413,8 @@ def export_csv(req: CsvExportRequest) -> list[Any]:
     description=(
         "Download a webpage and extract the main readable text (stripping nav, "
         "ads, boilerplate). Use when the user gives a specific URL to summarise "
-        "or quote, or when web search results need deeper context from one page."
+        "or quote. Prefer this over web search for exact URL requests; use web "
+        "search only when broader discovery is requested."
     ),
     operation_id="fetch_url",
 )
@@ -372,7 +466,7 @@ def lookup_doi_citation(req: CitationRequest) -> dict:
     try:
         r = httpx.get(
             f"https://api.crossref.org/works/{quote(doi, safe='')}",
-            headers={"User-Agent": "owui-tool-server/0.2.1"},
+            headers={"User-Agent": "owui-tool-server/0.3.0"},
             timeout=15.0,
         )
         r.raise_for_status()
